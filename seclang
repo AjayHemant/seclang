@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+
+"""
+
+Seclang CLI v1 (Beta) – Jun 2025
+
+
+---
+
+• Stand‑alone hacking‑friendly scripting language
+
+• NO import statements required for core scans or file ops
+
+– port_scan(), stealth_scan(), os_scan(), aggressive_scan(), version_scan()
+
+– file_write(), file_append(), file_read(), file_clear()
+
+• Still supports optional import <tool> for extra CLI utilities
+
+"""
+
+import sys
+
+import subprocess
+
+import re
+
+import shutil
+
+import math
+
+import time as t
+
+from colorama import Fore, Style, init
+
+init(autoreset=True)
+
+variables = {}
+
+available_modules = {}  # remains for optional extra imports
+
+========= Tool Checker =========
+
+def is_tool_installed(tool):
+
+return shutil.which(tool) is not None
+
+def install_tool(tool):
+
+print(Fore.YELLOW + f"Installing {tool}…")
+
+try:
+
+    subprocess.check_call(["sudo", "apt", "install", "-y", tool])
+
+except subprocess.CalledProcessError as e:
+
+    print(Fore.RED + f"Failed to install {tool}: {e}")
+
+    sys.exit(1)
+
+========= Help =========
+
+def show_help():
+
+banner = f"""
+
+{Fore.CYAN}=============================
+
+    Seclang CLI v1
+
+=============================
+
+Usage: Seclang <script.sl>
+
+
+
+{Fore.GREEN}Built‑in Commands (no import):
+
+--------------------------------
+
+  print(text)            – display text
+
+  input(prompt)          – get user input
+
+
+
+  port_scan(target)      – fast default scan
+
+  stealth_scan(target)   – TCP SYN half‑open
+
+  os_scan(target)        – OS detection
+
+  aggressive_scan(target)– -A combo scan
+
+  version_scan(target)   – service version scan
+
+
+
+  file_write(name,data)  – write file
+
+  file_append(name,data) – append file
+
+  file_read(name)        – read file
+
+  file_clear(name)       – truncate file
+
+
+
+{Fore.GREEN}Optional Imports (auto‑installs tool):
+
+--------------------------------------
+
+  whois, ping, traceroute, nslookup, curl, wget, host, dig,
+
+  ifconfig, ip_addr, netstat, tcpdump, arp, ssh_version
+
+  math   – add, sub, mul, div
+
+  time   – sleep, current_time
+
+"""
+
+print(banner)
+
+sys.exit(0)
+
+========= Math & Time utils =========
+
+def add(x, y):
+
+return str(float(x) + float(y))
+
+def sub(x, y):
+
+return str(float(x) - float(y))
+
+def mul(x, y):
+
+return str(float(x) * float(y))
+
+def div(x, y):
+
+try:
+
+    return str(float(x) / float(y))
+
+except ZeroDivisionError:
+
+    return "Error: Division by zero"
+
+def sleep(seconds):
+
+t.sleep(float(seconds))
+
+return ""
+
+def current_time():
+
+return t.strftime("%Y-%m-%d %H:%M:%S")
+
+========= Low‑level network helpers =========
+
+def whois(domain): return subprocess.getoutput(f"whois {domain}")
+
+def ping(host): return subprocess.getoutput(f"ping -c 4 {host}")
+
+def traceroute(host): return subprocess.getoutput(f"traceroute {host}")
+
+def nslookup(domain): return subprocess.getoutput(f"nslookup {domain}")
+
+def curl(url): return subprocess.getoutput(f"curl -s {url}")
+
+def wget(url): return subprocess.getoutput(f"wget -qO- {url}")
+
+def host(domain): return subprocess.getoutput(f"host {domain}")
+
+def dig(domain): return subprocess.getoutput(f"dig {domain}")
+
+def ifconfig(): return subprocess.getoutput("ifconfig")
+
+def ip_addr(): return subprocess.getoutput("ip addr")
+
+def netstat(): return subprocess.getoutput("netstat -tuln")
+
+def tcpdump(interface="any"): return subprocess.getoutput(f"timeout 5 tcpdump -i {interface} -c 5")
+
+def arp(): return subprocess.getoutput("arp -a")
+
+def ssh_version(): return subprocess.getoutput("ssh -V")
+
+========= Nmap wrappers =========
+
+def _ensure_nmap():
+
+if not is_tool_installed("nmap"):
+
+    install_tool("nmap")
+
+def _run_nmap(args: str):
+
+_ensure_nmap()
+
+try:
+
+    result = subprocess.check_output(f"nmap -Pn {args}", shell=True)
+
+    return result.decode()
+
+except subprocess.CalledProcessError as e:
+
+    return f"Error: {e}"
+
+def port_scan(target, time="3"):
+
+return _run_nmap(f"-T{time} {target}")
+
+def stealth_scan(target, time="3"):
+
+return _run_nmap(f"-sS -T{time} {target}")
+
+def os_scan(target, time="3"):
+
+return _run_nmap(f"-O -T{time} {target}")
+
+def aggressive_scan(target, time="3"):
+
+return _run_nmap(f"-A -T{time} {target}")
+
+def version_scan(target, time="3"):
+
+return _run_nmap(f"-sV -T{time} {target}")
+
+========= File Operations =========
+
+def file_write(filename, content):
+
+try:
+
+    with open(filename, "w") as f:
+
+        f.write(content)
+
+except Exception as e:
+
+    print(Fore.RED + f"File write error: {e}")
+
+def file_append(filename, content):
+
+try:
+
+    with open(filename, "a") as f:
+
+        f.write(content)
+
+except Exception as e:
+
+    print(Fore.RED + f"File append error: {e}")
+
+def file_read(filename):
+
+try:
+
+    with open(filename, "r") as f:
+
+        return f.read()
+
+except Exception as e:
+
+    print(Fore.RED + f"File read error: {e}")
+
+    return ""
+
+def file_clear(filename):
+
+try:
+
+    open(filename, "w").close()
+
+except Exception as e:
+
+    print(Fore.RED + f"File clear error: {e}")
+
+========= Function Dispatcher =========
+
+def execute_function(name, args):
+
+try:
+
+    if name == "print":
+
+        print(args[0])
+
+        return ""
+
+    elif name == "input":
+
+        return input(args[0])
+
+
+
+    # Built‑in scanning & file ops (no import needed)
+
+    if name in globals():
+
+        return globals()[name](*args)
+
+
+
+    # Unknown function
+
+    print(Fore.RED + f"Unknown function: {name}")
+
+except Exception as e:
+
+    print(Fore.RED + f"Execution error in '{name}': {e}")
+
+========= Parser =========
+
+def parse_and_execute(filename):
+
+try:
+
+    with open(filename, "r") as f:
+
+        lines = f.readlines()
+
+except Exception as e:
+
+    print(Fore.RED + f"Script load error: {e}")
+
+    sys.exit(1)
+
+
+
+for line in lines:
+
+    line = line.strip()
+
+    if not line or line.startswith("#"):
+
+        continue
+
+
+
+    # ----- optional import handling (auto‑install) -----
+
+    if line.startswith("import "):
+
+        module = line.replace("import", "").strip()
+
+        cli_tools = {
+
+            "whois": "whois", "ping": "iputils-ping", "traceroute": "traceroute",
+
+            "nslookup": "dnsutils", "curl": "curl", "wget": "wget",
+
+            "host": "bind9-host", "dig": "dnsutils", "ifconfig": "net-tools",
+
+            "ip_addr": "iproute2", "netstat": "net-tools", "tcpdump": "tcpdump",
+
+            "arp": "net-tools", "ssh_version": "openssh-client"
+
+        }
+
+        pkg = cli_tools.get(module)
+
+        if pkg and not is_tool_installed(pkg):
+
+            install_tool(pkg)
+
+        available_modules[module] = True
+
+        continue
+
+
+
+    # ----- assignment or direct function call -----
+
+    if "=" in line and not line.startswith(("print", "input")):
+
+        key, val = map(str.strip, line.split("=", 1))
+
+        if "(" in val and ")" in val:  # function call on RHS
+
+            func_match = re.match(r"(\w+)(.*?)", val)
+
+            if func_match:
+
+                func_name, raw_args = func_match.groups()
+
+                args = [variables.get(a.strip(), a.strip()) for a in raw_args.split(",") if a.strip()]
+
+                variables[key] = execute_function(func_name, args)
+
+        else:
+
+            variables[key] = val.strip('"').strip("'")
+
+        continue
+
+
+
+    # direct function call by itself
+
+    func_match = re.match(r"(\w+)(.*?)", line)
+
+    if func_match:
+
+        func_name, raw_args = func_match.groups()
+
+        args = [variables.get(a.strip(), a.strip()) for a in raw_args.split(",") if a.strip()]
+
+        execute_function(func_name, args)
+
+# ========= Entrypoint =========
+if len(sys.argv) != 2:
+    print(Fore.RED + "Usage: nagapamu <script.sl> OR nagapamu --help")
+    sys.exit(1)
+
+if not sys.argv[1].endswith(".sl"):
+    print(Fore.RED + "Error: Script file must have a .sl extension")
+    sys.exit(1)
+
+if sys.argv[1] in ["--help", "-h"]:
+    show_help()
+
+parse_and_execute(sys.argv[1])

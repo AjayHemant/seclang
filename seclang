@@ -1,428 +1,606 @@
-#!/usr/bin/env python3
+# seclang.py
+# A command-line tool to run complex terminal commands using simple shortcuts.
 
-"""
-
-Seclang CLI v1 (Beta) – Jun 2025
-
-
----
-
-• Stand‑alone hacking‑friendly scripting language
-
-• NO import statements required for core scans or file ops
-
-– port_scan(), stealth_scan(), os_scan(), aggressive_scan(), version_scan()
-
-– file_write(), file_append(), file_read(), file_clear()
-
-• Still supports optional import <tool> for extra CLI utilities
-
-"""
-
-import sys
-
+import click
+import datetime
+import getpass
+import json
+import os
+import shlex
 import subprocess
+import sys
+from pathlib import Path
+import yaml
 
-import re
+# --- Configuration and Constants ---
 
-import shutil
+# Define the home directory for configuration and logs
+# By default, config is in the script's directory (`.seclang/`).
+# You can change this to a different location, for example, to keep it with the script:
+CONFIG_DIR = Path(__file__).resolve().parent / ".seclang"
+CONFIG_FILE = CONFIG_DIR / "config.yml"
+LOG_FILE = CONFIG_DIR / "history.log"
 
-import math
+# Default configuration to be created on the first run
+DEFAULT_CONFIG = """
+# -----------------------------------------------------------------------------
+# seclang - Example Configuration
+#
+# This file defines the command shortcuts available to the 'seclang' tool.
+# You can add, remove, or modify commands here.
+# -----------------------------------------------------------------------------
 
-import time as t
+commands:
+  # A simple, safe command to test connectivity.
+  ping_test:
+    cmd_template: ["ping", "-c", "4", "{target}"]
+    desc: "Ping a target 4 times to check connectivity."
+    placeholders:
+      target: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-from colorama import Fore, Style, init
+  # An example of a more powerful command that requires confirmation and sudo.
+  stealth_scan:
+    cmd_template: ["nmap", "-sS", "{target}"]
+    desc: "Run a stealthy TCP SYN scan (requires sudo, use responsibly)."
+    placeholders:
+      target: {required: true}
+    require_confirm: true
+    require_sudo: true
+    disabled: false
 
-init(autoreset=True)
+  # Install software from source using make.
+  make_install:
+    cmd_template: ["make", "install"]
+    desc: "Run 'make install' from a source directory (often requires sudo)."
+    placeholders: {}
+    require_confirm: true
+    require_sudo: true
+    disabled: false
 
-variables = {}
+  # Install a package using apt.
+  apt_install:
+    cmd_template: ["apt", "install", "{package}"]
+    desc: "Install a package using apt (requires sudo)."
+    placeholders:
+      package: {required: true}
+    require_confirm: true
+    require_sudo: true
+    disabled: false
 
-available_modules = {}  # remains for optional extra imports
+  # Find and kill a process using a specific port.
+  kill_port:
+    cmd_template: ["fuser", "-k", "{port}/tcp"]
+    desc: "Kill the process running on a specific TCP port (requires sudo)."
+    placeholders:
+      port: {required: true}
+    require_confirm: true
+    require_sudo: true
+    disabled: false
 
-========= Tool Checker =========
+  # List all Docker containers.
+  docker_ps:
+    cmd_template: ["docker", "ps", "-a"]
+    desc: "List all Docker containers (running and stopped)."
+    placeholders: {}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-def is_tool_installed(tool):
+  # A command with no placeholders for a common task.
+  list_details:
+    cmd_template: ["ls", "-lah"]
+    desc: "List files and directories with detailed information (long format)."
+    placeholders: {}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-return shutil.which(tool) is not None
+  # Another command with no placeholders.
+  disk_usage:
+    cmd_template: ["df", "-h"]
+    desc: "Display free disk space in human-readable format."
+    placeholders: {}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-def install_tool(tool):
+  # A command to follow a log file.
+  tail_log:
+    cmd_template: ["tail", "-f", "{logfile}"]
+    desc: "Follow a log file in real-time (press Ctrl+C to stop)."
+    placeholders:
+      logfile: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-print(Fore.YELLOW + f"Installing {tool}…")
+  # A command with multiple placeholders.
+  find_files:
+    cmd_template: ["find", "{path}", "-name", "{pattern}"]
+    desc: "Find files by name pattern in a specific path."
+    placeholders:
+      path: {required: true}
+      pattern: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-try:
+  # A disabled command that will not be executable.
+  disabled_example:
+    cmd_template: ["echo", "This command is disabled and cannot be run."]
+    desc: "An example of a disabled command."
+    placeholders: {}
+    require_confirm: false
+    require_sudo: false
+    disabled: true
 
-    subprocess.check_call(["sudo", "apt", "install", "-y", tool])
+  # --- File Management Commands ---
 
-except subprocess.CalledProcessError as e:
+  # Calculate the size of a directory.
+  dir_size:
+    cmd_template: ["du", "-sh", "{path}"]
+    desc: "Calculate and display the total size of a directory."
+    placeholders:
+      path: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-    print(Fore.RED + f"Failed to install {tool}: {e}")
+  # Create a new directory, including parent directories.
+  make_dir:
+    cmd_template: ["mkdir", "-p", "-v", "{path}"]
+    desc: "Create a directory, including any parent directories needed."
+    placeholders:
+      path: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-    sys.exit(1)
+  # Securely remove a file or directory.
+  remove_item:
+    cmd_template: ["rm", "-rfv", "{path}"]
+    desc: "DANGEROUS: Recursively and forcefully remove a file or directory."
+    placeholders:
+      path: {required: true}
+    require_confirm: true
+    require_sudo: false
+    disabled: false
 
-========= Help =========
+  # Change ownership of a file/directory.
+  c_chown:
+    cmd_template: ["chown", "-R", "{owner}:{group}", "{path}"]
+    desc: "seclang: Recursively change the owner and group of a file or directory (requires sudo)."
+    placeholders:
+      owner: {required: true}
+      group: {required: true}
+      path: {required: true}
+    require_confirm: true
+    require_sudo: true
+    disabled: false
 
-def show_help():
+  # Copy a file or directory.
+  copy_item:
+    cmd_template: ["cp", "-rv", "{source}", "{destination}"]
+    desc: "Copy a file or directory recursively and verbosely."
+    placeholders:
+      source: {required: true}
+      destination: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-banner = f"""
+  # Move or rename a file or directory.
+  move_item:
+    cmd_template: ["mv", "-v", "{source}", "{destination}"]
+    desc: "Move or rename a file or directory."
+    placeholders:
+      source: {required: true}
+      destination: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-{Fore.CYAN}=============================
+  # Create an empty file.
+  touch_file:
+    cmd_template: ["touch", "{filename}"]
+    desc: "Create an empty file or update its modification time."
+    placeholders:
+      filename: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-    Seclang CLI v1
+  # Change file permissions.
+  set_perms:
+    cmd_template: ["chmod", "-v", "{mode}", "{path}"]
+    desc: "Change permissions of a file/directory (e.g., 755, u+x)."
+    placeholders:
+      mode: {required: true}
+      path: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-=============================
+  # Create a compressed tar archive.
+  create_archive:
+    cmd_template: ["tar", "-czvf", "{archive_name}.tar.gz", "{source_dir}"]
+    desc: "Create a compressed .tar.gz archive from a source directory."
+    placeholders:
+      archive_name: {required: true}
+      source_dir: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-Usage: Seclang <script.sl>
+  # Extract a compressed tar archive.
+  extract_archive:
+    cmd_template: ["tar", "-xzvf", "{archive_file}"]
+    desc: "Extract a .tar.gz archive."
+    placeholders:
+      archive_file: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
+  # Create a symbolic link.
+  create_symlink:
+    cmd_template: ["ln", "-sv", "{target}", "{link_name}"]
+    desc: "Create a symbolic link to a target file or directory."
+    placeholders:
+      target: {required: true}
+      link_name: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
+  # Display the contents of a file.
+  cat_file:
+    cmd_template: ["cat", "{filename}"]
+    desc: "Display the contents of a file."
+    placeholders:
+      filename: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-{Fore.GREEN}Built‑in Commands (no import):
+  # View the first few lines of a file.
+  head_file:
+    cmd_template: ["head", "{filename}"]
+    desc: "Display the first 10 lines of a file."
+    placeholders:
+      filename: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
---------------------------------
+  # View the last few lines of a file.
+  tail_file:
+    cmd_template: ["tail", "{filename}"]
+    desc: "Display the last 10 lines of a file."
+    placeholders:
+      filename: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-  print(text)            – display text
+  # Count lines, words, and characters in a file.
+  word_count:
+    cmd_template: ["wc", "{filename}"]
+    desc: "Count lines, words, and characters in a file."
+    placeholders:
+      filename: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-  input(prompt)          – get user input
+  # Compare two files.
+  diff_files:
+    cmd_template: ["diff", "-u", "{file1}", "{file2}"]
+    desc: "Compare two files and show the differences."
+    placeholders:
+      file1: {required: true}
+      file2: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
+  # --- Networking Commands ---
 
+  # Fetch a URL with curl.
+  curl_get:
+    cmd_template: ["curl", "-iL", "{url}"]
+    desc: "Fetch a URL with headers and follow redirects."
+    placeholders:
+      url: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-  port_scan(target)      – fast default scan
+  # Download a file with wget.
+  wget_file:
+    cmd_template: ["wget", "-c", "{url}"]
+    desc: "Download a file from a URL, continuing partial downloads."
+    placeholders:
+      url: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-  stealth_scan(target)   – TCP SYN half‑open
+  # Perform a DNS lookup.
+  dns_lookup:
+    cmd_template: ["dig", "+short", "{domain}"]
+    desc: "Perform a quick DNS A record lookup for a domain."
+    placeholders:
+      domain: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-  os_scan(target)        – OS detection
+  # List open ports.
+  open_ports:
+    cmd_template: ["ss", "-tuln"]
+    desc: "List all listening TCP and UDP ports (requires sudo for process info)."
+    placeholders: {}
+    require_confirm: false
+    require_sudo: true
+    disabled: false
 
-  aggressive_scan(target)– -A combo scan
+  # --- Other useful commands from previous suggestions ---
+  c_uptime:
+    cmd_template: ["uptime", "-p"]
+    desc: "Show system uptime in a pretty format."
+    placeholders: {}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-  version_scan(target)   – service version scan
-
-
-
-  file_write(name,data)  – write file
-
-  file_append(name,data) – append file
-
-  file_read(name)        – read file
-
-  file_clear(name)       – truncate file
-
-
-
-{Fore.GREEN}Optional Imports (auto‑installs tool):
-
---------------------------------------
-
-  whois, ping, traceroute, nslookup, curl, wget, host, dig,
-
-  ifconfig, ip_addr, netstat, tcpdump, arp, ssh_version
-
-  math   – add, sub, mul, div
-
-  time   – sleep, current_time
-
+  git_pull:
+    cmd_template: ["git", "pull"]
+    desc: "Run 'git pull' in the current directory."
+    placeholders: {}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 """
 
-print(banner)
-
-sys.exit(0)
-
-========= Math & Time utils =========
-
-def add(x, y):
-
-return str(float(x) + float(y))
-
-def sub(x, y):
-
-return str(float(x) - float(y))
-
-def mul(x, y):
-
-return str(float(x) * float(y))
-
-def div(x, y):
-
-try:
-
-    return str(float(x) / float(y))
-
-except ZeroDivisionError:
-
-    return "Error: Division by zero"
-
-def sleep(seconds):
-
-t.sleep(float(seconds))
-
-return ""
-
-def current_time():
-
-return t.strftime("%Y-%m-%d %H:%M:%S")
-
-========= Low‑level network helpers =========
-
-def whois(domain): return subprocess.getoutput(f"whois {domain}")
-
-def ping(host): return subprocess.getoutput(f"ping -c 4 {host}")
-
-def traceroute(host): return subprocess.getoutput(f"traceroute {host}")
-
-def nslookup(domain): return subprocess.getoutput(f"nslookup {domain}")
-
-def curl(url): return subprocess.getoutput(f"curl -s {url}")
-
-def wget(url): return subprocess.getoutput(f"wget -qO- {url}")
-
-def host(domain): return subprocess.getoutput(f"host {domain}")
-
-def dig(domain): return subprocess.getoutput(f"dig {domain}")
-
-def ifconfig(): return subprocess.getoutput("ifconfig")
-
-def ip_addr(): return subprocess.getoutput("ip addr")
-
-def netstat(): return subprocess.getoutput("netstat -tuln")
-
-def tcpdump(interface="any"): return subprocess.getoutput(f"timeout 5 tcpdump -i {interface} -c 5")
-
-def arp(): return subprocess.getoutput("arp -a")
-
-def ssh_version(): return subprocess.getoutput("ssh -V")
-
-========= Nmap wrappers =========
-
-def _ensure_nmap():
-
-if not is_tool_installed("nmap"):
-
-    install_tool("nmap")
-
-def _run_nmap(args: str):
-
-_ensure_nmap()
-
-try:
-
-    result = subprocess.check_output(f"nmap -Pn {args}", shell=True)
-
-    return result.decode()
-
-except subprocess.CalledProcessError as e:
-
-    return f"Error: {e}"
-
-def port_scan(target, time="3"):
-
-return _run_nmap(f"-T{time} {target}")
-
-def stealth_scan(target, time="3"):
-
-return _run_nmap(f"-sS -T{time} {target}")
-
-def os_scan(target, time="3"):
-
-return _run_nmap(f"-O -T{time} {target}")
-
-def aggressive_scan(target, time="3"):
-
-return _run_nmap(f"-A -T{time} {target}")
-
-def version_scan(target, time="3"):
-
-return _run_nmap(f"-sV -T{time} {target}")
-
-========= File Operations =========
-
-def file_write(filename, content):
-
-try:
-
-    with open(filename, "w") as f:
-
-        f.write(content)
-
-except Exception as e:
-
-    print(Fore.RED + f"File write error: {e}")
-
-def file_append(filename, content):
-
-try:
-
-    with open(filename, "a") as f:
-
-        f.write(content)
-
-except Exception as e:
-
-    print(Fore.RED + f"File append error: {e}")
-
-def file_read(filename):
-
-try:
-
-    with open(filename, "r") as f:
-
-        return f.read()
-
-except Exception as e:
-
-    print(Fore.RED + f"File read error: {e}")
-
-    return ""
-
-def file_clear(filename):
-
-try:
-
-    open(filename, "w").close()
-
-except Exception as e:
-
-    print(Fore.RED + f"File clear error: {e}")
-
-========= Function Dispatcher =========
-
-def execute_function(name, args):
-
-try:
-
-    if name == "print":
-
-        print(args[0])
-
-        return ""
-
-    elif name == "input":
-
-        return input(args[0])
-
-
-
-    # Built‑in scanning & file ops (no import needed)
-
-    if name in globals():
-
-        return globals()[name](*args)
-
-
-
-    # Unknown function
-
-    print(Fore.RED + f"Unknown function: {name}")
-
-except Exception as e:
-
-    print(Fore.RED + f"Execution error in '{name}': {e}")
-
-========= Parser =========
-
-def parse_and_execute(filename):
-
-try:
-
-    with open(filename, "r") as f:
-
-        lines = f.readlines()
-
-except Exception as e:
-
-    print(Fore.RED + f"Script load error: {e}")
-
-    sys.exit(1)
-
-
-
-for line in lines:
-
-    line = line.strip()
-
-    if not line or line.startswith("#"):
-
-        continue
-
-
-
-    # ----- optional import handling (auto‑install) -----
-
-    if line.startswith("import "):
-
-        module = line.replace("import", "").strip()
-
-        cli_tools = {
-
-            "whois": "whois", "ping": "iputils-ping", "traceroute": "traceroute",
-
-            "nslookup": "dnsutils", "curl": "curl", "wget": "wget",
-
-            "host": "bind9-host", "dig": "dnsutils", "ifconfig": "net-tools",
-
-            "ip_addr": "iproute2", "netstat": "net-tools", "tcpdump": "tcpdump",
-
-            "arp": "net-tools", "ssh_version": "openssh-client"
-
-        }
-
-        pkg = cli_tools.get(module)
-
-        if pkg and not is_tool_installed(pkg):
-
-            install_tool(pkg)
-
-        available_modules[module] = True
-
-        continue
-
-
-
-    # ----- assignment or direct function call -----
-
-    if "=" in line and not line.startswith(("print", "input")):
-
-        key, val = map(str.strip, line.split("=", 1))
-
-        if "(" in val and ")" in val:  # function call on RHS
-
-            func_match = re.match(r"(\w+)(.*?)", val)
-
-            if func_match:
-
-                func_name, raw_args = func_match.groups()
-
-                args = [variables.get(a.strip(), a.strip()) for a in raw_args.split(",") if a.strip()]
-
-                variables[key] = execute_function(func_name, args)
-
+# --- Helper Functions ---
+
+def setup_config_dir():
+    """Ensures the config directory and default config file exist."""
+    if CONFIG_FILE.exists():
+        return
+    
+    click.echo(f"Welcome to seclang! Creating default configuration...")
+    try:
+        CONFIG_DIR.mkdir(exist_ok=True)
+        with open(CONFIG_FILE, "w") as f:
+            f.write(DEFAULT_CONFIG)
+        click.secho(f"✔ Default config created at: {CONFIG_FILE}", fg="green")
+        click.echo("You can now edit this file to add your own custom commands.")
+        click.echo("Run 'seclang list' to see available commands.")
+    except OSError as e:
+        click.secho(f"Error: Could not create config directory or file: {e}", fg="red", err=True)
+        sys.exit(1)
+
+def load_config():
+    """Loads and returns the command configurations from the YAML file."""
+    setup_config_dir()
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            config = yaml.safe_load(f)
+            # If the YAML file is empty or malformed, config might be None.
+            if not config:
+                return {}
+            return config.get("commands", {})
+    except (yaml.YAMLError, FileNotFoundError) as e:
+        click.secho(f"Error: Could not load or parse config file at {CONFIG_FILE}: {e}", fg="red", err=True)
+        sys.exit(1)
+
+def log_command(command_name, final_cmd, args, return_code):
+    """Logs a command execution to the history.log file in JSON format."""
+    log_entry = {
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "user": getpass.getuser(),
+        "command_name": command_name,
+        "executed_cmd": final_cmd,
+        "args": args,
+        "return_code": return_code,
+    }
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(json.dumps(log_entry) + "\n")
+    except OSError as e:
+        click.secho(f"Warning: Could not write to log file {LOG_FILE}: {e}", fg="yellow", err=True)
+
+def build_command(cmd_def, user_args):
+    """Builds the final command list by substituting placeholders with user arguments."""
+    placeholders = cmd_def.get("placeholders", {}) or {}
+    required_placeholders = [p for p, rules in placeholders.items() if rules.get("required")]
+
+    if len(user_args) != len(required_placeholders):
+        click.secho(f"Error: Incorrect number of arguments for '{cmd_def['name']}'.", fg="red", err=True)
+        click.echo(f"Expected {len(required_placeholders)} arguments for: {', '.join(required_placeholders)}")
+        click.echo(f"Received {len(user_args)}.")
+        sys.exit(1)
+
+    arg_map = dict(zip(required_placeholders, user_args))
+    final_cmd = []
+    
+    for token in cmd_def["cmd_template"]:
+        if token.startswith("{") and token.endswith("}"):
+            placeholder_name = token[1:-1]
+            if placeholder_name in arg_map:
+                # subprocess with a list handles arguments safely, no manual quoting needed.
+                final_cmd.append(arg_map[placeholder_name])
+            else:
+                # This case handles tokens that look like placeholders but aren't in the spec
+                final_cmd.append(token)
         else:
+            final_cmd.append(token)
+            
+    # Prepend 'sudo' if required by the command definition
+    if cmd_def.get("require_sudo") and "sudo" not in final_cmd:
+        final_cmd.insert(0, "sudo")
+        
+    return final_cmd
 
-            variables[key] = val.strip('"').strip("'")
+# --- CLI Command Definitions ---
 
-        continue
+@click.group()
+@click.version_option(version="1.0.0", prog_name="seclang", message="%(prog)s version %(version)s\nMade by sreehitha and team")
+def cli():
+    """
+    SecLang is a tool to manage and run complex shell commands using simple,
+    memorable shortcuts.
 
+    Note: This tool is designed for Unix/Linux environments (like Linux, macOS, or WSL
+    on Windows). The 'install' command specifically targets bash and zsh.
+    """
+    pass
 
+@cli.command("list")
+def list_commands():
+    """Lists all available command shortcuts."""
+    commands = load_config()
+    if not commands:
+        click.echo("No commands found in your configuration file.")
+        click.echo(f"Add some to {CONFIG_FILE} to get started!")
+        return
 
-    # direct function call by itself
+    click.secho("Available Commands:", bold=True)
+    for name, details in commands.items():
+        status = click.style(" (disabled)", fg="yellow") if details.get("disabled") else ""
+        desc = details.get("desc", "No description.")
+        click.echo(f"- {click.style(name, fg='cyan', bold=True)}{status}: {desc}")
 
-    func_match = re.match(r"(\w+)(.*?)", line)
+@cli.command("show")
+@click.argument("name")
+def show_command(name):
+    """Shows detailed information about a specific command."""
+    commands = load_config()
+    cmd_def = commands.get(name)
 
-    if func_match:
+    if not cmd_def:
+        click.secho(f"Error: Command '{name}' not found.", fg="red", err=True)
+        sys.exit(1)
 
-        func_name, raw_args = func_match.groups()
+    click.secho(f"Details for '{name}':", bold=True)
+    click.echo(f"  Description: {cmd_def.get('desc', 'N/A')}")
+    click.echo(f"  Template:    {' '.join(cmd_def.get('cmd_template', []))}")
+    click.echo(f"  Confirm:     {cmd_def.get('require_confirm', False)}")
+    click.echo(f"  Sudo:        {cmd_def.get('require_sudo', False)}")
+    click.echo(f"  Disabled:    {cmd_def.get('disabled', False)}")
+    
+    placeholders = cmd_def.get("placeholders") or {}
+    if placeholders:
+        click.echo("  Placeholders:")
+        for p_name, rules in placeholders.items():
+            req = "required" if rules.get("required") else "optional"
+            click.echo(f"    - {{{p_name}}} ({req})")
+    else:
+        click.echo("  Placeholders: None")
 
-        args = [variables.get(a.strip(), a.strip()) for a in raw_args.split(",") if a.strip()]
+@cli.command("run")
+@click.argument("name")
+@click.argument("args", nargs=-1)
+def run_command(name, args):
+    """Executes a command shortcut with the given arguments."""
+    commands = load_config()
+    cmd_def = commands.get(name)
 
-        execute_function(func_name, args)
+    if not cmd_def:
+        click.secho(f"Error: Command '{name}' not found.", fg="red", err=True)
+        sys.exit(1)
 
-# ========= Entrypoint =========
-if len(sys.argv) != 2:
-    print(Fore.RED + "Usage: nagapamu <script.sl> OR nagapamu --help")
-    sys.exit(1)
+    if cmd_def.get("disabled"):
+        click.secho(f"Error: Command '{name}' is disabled and cannot be run.", fg="yellow", err=True)
+        sys.exit(1)
+    
+    # Add the command name to the definition for easier access
+    cmd_def['name'] = name
+    
+    final_cmd = build_command(cmd_def, args)
+    
+    click.echo(f"Executing '{name}': ", nl=False)
+    click.secho(' '.join(final_cmd), fg="bright_blue")
 
-if not sys.argv[1].endswith(".sl"):
-    print(Fore.RED + "Error: Script file must have a .sl extension")
-    sys.exit(1)
+    if cmd_def.get("require_confirm"):
+        if not click.confirm("Do you want to continue?"):
+            click.echo("Execution cancelled by user.")
+            sys.exit(0)
+    
+    # --- Command Execution with '&&' support ---
+    try:
+        # Split command list by '&&' to run them sequentially
+        sub_commands = []
+        current_cmd = []
+        for token in final_cmd:
+            if token == "&&":
+                if current_cmd:
+                    sub_commands.append(current_cmd)
+                    current_cmd = []
+            else:
+                current_cmd.append(token)
+        if current_cmd:
+            sub_commands.append(current_cmd)
 
-if sys.argv[1] in ["--help", "-h"]:
-    show_help()
+        final_return_code = 0
+        for i, sub_cmd in enumerate(sub_commands):
+            click.echo(f"  -> Running part {i+1}/{len(sub_commands)}: {click.style(' '.join(sub_cmd), fg='bright_blue')}")
+            result = subprocess.run(sub_cmd, check=False)
+            final_return_code = result.returncode
+            if result.returncode != 0:
+                click.secho(f"  Sub-command failed with exit code {result.returncode}. Halting execution.", fg="red")
+                break
+        
+        log_command(name, final_cmd, args, final_return_code)
+    except FileNotFoundError:
+        click.secho(f"Error: The program '{final_cmd[0]}' was not found.", fg="red", err=True)
+        click.echo("Please ensure it is installed and in your system's PATH.")
+        log_command(name, final_cmd, args, -1)
+        sys.exit(1)
+    except Exception as e:
+        click.secho(f"An unexpected error occurred: {e}", fg="red", err=True)
+        log_command(name, final_cmd, args, -1)
+        sys.exit(1)
 
-parse_and_execute(sys.argv[1])
+@cli.command("history")
+def show_history():
+    """Shows the last 20 executed commands from the log."""
+    if not LOG_FILE.exists():
+        click.echo("No history log found. Run some commands first!")
+        return
+
+    click.secho("Command Execution History (last 20):", bold=True)
+    try:
+        with open(LOG_FILE, "r") as f:
+            lines = f.readlines()
+        
+        if not lines:
+            click.echo("History is empty.")
+            return
+
+        for line in lines[-20:]:
+            log = json.loads(line)
+            ts = datetime.datetime.fromisoformat(log['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
+            status_color = "green" if log['return_code'] == 0 else "red"
+            status = click.style(f"RC={log['return_code']}", fg=status_color)
+            cmd_name = click.style(log['command_name'], fg="cyan")
+            click.echo(f"[{ts}] {status} - {cmd_name} {' '.join(log['args'])}")
+            
+    except (json.JSONDecodeError, OSError) as e:
+        click.secho(f"Error reading history file: {e}", fg="red", err=True)
+
+@cli.command("install")
+def install_wrappers():
+    """Installs shell functions to run shortcuts directly."""
+    commands = load_config()
+    shell = Path(os.environ.get("SHELL", "")).name
+    
+    if shell in ("bash", "zsh"):
+        rc_file_path = Path.home() / f".{shell}rc"
+    else:
+        click.secho(f"Error: Unsupported shell '{shell}'. Only 'bash' and 'zsh' are supported.", fg="re

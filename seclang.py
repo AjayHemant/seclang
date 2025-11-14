@@ -1,295 +1,660 @@
-import socket
-import os
-import threading
+# seclang.py
+# A command-line tool to run complex terminal commands using simple shortcuts.
+
+import click
+import datetime
+import getpass
 import json
-import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+import yaml
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.asymmetric.x25519 import (
-    X25519PrivateKey, X25519PublicKey
-)
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes, serialization
+# --- Configuration and Constants ---
 
-# QR code + scanner
-import qrcode
-from PIL import Image, ImageTk
-import cv2
-from pyzbar.pyzbar import decode
+# Define the home directory for configuration and logs
+# By default, config is in the script's directory (`.seclang/`).
+# You can change this to a different location, for example, to keep it with the script:
+CONFIG_DIR = Path(__file__).resolve().parent / ".seclang"
+CONFIG_FILE = CONFIG_DIR / "config.yml"
+LOG_FILE = CONFIG_DIR / "history.log"
 
-PORT = 5001
-CHUNK_SIZE = 1024 * 1024
-KEY_LEN = 32
+# Default configuration to be created on the first run
+DEFAULT_CONFIG = """
+# -----------------------------------------------------------------------------
+# seclang - Example Configuration
+#
+# This file defines the command shortcuts available to the 'seclang' tool.
+# You can add, remove, or modify commands here.
+# -----------------------------------------------------------------------------
 
+commands:
+  # A simple, safe command to test connectivity.
+  ping_test:
+    cmd_template: ["ping", "-c", "4", "{target}"]
+    desc: "Ping a target 4 times to check connectivity."
+    placeholders:
+      target: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-# ---------- crypto helpers ----------
-def derive_shared_key(local_private: X25519PrivateKey, peer_public_bytes: bytes) -> bytes:
-    peer_pub = X25519PublicKey.from_public_bytes(peer_public_bytes)
-    shared = local_private.exchange(peer_pub)
-    hkdf = HKDF(
-        algorithm=hashes.SHA256(),
-        length=KEY_LEN,
-        salt=None,
-        info=b"darkdoc file transfer",
-    )
-    return hkdf.derive(shared)
+  # An example of a more powerful command that requires confirmation and sudo.
+  stealth_scan:
+    cmd_template: ["nmap", "-sS", "{target}"]
+    desc: "Run a stealthy TCP SYN scan (requires sudo, use responsibly)."
+    placeholders:
+      target: {required: true}
+    require_confirm: true
+    require_sudo: true
+    disabled: false
 
+  # Install software from source using make.
+  make_install:
+    cmd_template: ["make", "install"]
+    desc: "Run 'make install' from a source directory (often requires sudo)."
+    placeholders: {}
+    require_confirm: true
+    require_sudo: true
+    disabled: false
 
-def encrypt_chunk(plaintext: bytes, key: bytes) -> bytes:
-    aesgcm = AESGCM(key)
-    nonce = os.urandom(12)
-    ct = aesgcm.encrypt(nonce, plaintext, None)
-    return nonce + ct
+  # Install a package using apt.
+  apt_install:
+    cmd_template: ["apt", "install", "{package}"]
+    desc: "Install a package using apt (requires sudo)."
+    placeholders:
+      package: {required: true}
+    require_confirm: true
+    require_sudo: true
+    disabled: false
 
+  # Find and kill a process using a specific port.
+  kill_port:
+    cmd_template: ["fuser", "-k", "{port}/tcp"]
+    desc: "Kill the process running on a specific TCP port (requires sudo)."
+    placeholders:
+      port: {required: true}
+    require_confirm: true
+    require_sudo: true
+    disabled: false
 
-def decrypt_chunk(enc: bytes, key: bytes) -> bytes:
-    nonce = enc[:12]
-    ct = enc[12:]
-    aesgcm = AESGCM(key)
-    return aesgcm.decrypt(nonce, ct, None)
+  # List all Docker containers.
+  docker_ps:
+    cmd_template: ["docker", "ps", "-a"]
+    desc: "List all Docker containers (running and stopped)."
+    placeholders: {}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
+  # A command with no placeholders for a common task.
+  list_details:
+    cmd_template: ["ls", "-lah"]
+    desc: "List files and directories with detailed information (long format)."
+    placeholders: {}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-# ---------- networking helpers ----------
-def recv_exact(sock: socket.socket, n: int) -> bytes:
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("Connection closed unexpectedly")
-        buf += chunk
-    return buf
+  # Another command with no placeholders.
+  disk_usage:
+    cmd_template: ["df", "-h"]
+    desc: "Display free disk space in human-readable format."
+    placeholders: {}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
+  # A command to follow a log file.
+  tail_log:
+    cmd_template: ["tail", "-f", "{logfile}"]
+    desc: "Follow a log file in real-time (press Ctrl+C to stop)."
+    placeholders:
+      logfile: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-def send_prefixed(sock: socket.socket, data: bytes):
-    sock.sendall(len(data).to_bytes(4, "big") + data)
+  # A command with multiple placeholders.
+  find_files:
+    cmd_template: ["find", "{path}", "-name", "{pattern}"]
+    desc: "Find files by name pattern in a specific path."
+    placeholders:
+      path: {required: true}
+      pattern: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
+  # A disabled command that will not be executable.
+  disabled_example:
+    cmd_template: ["echo", "This command is disabled and cannot be run."]
+    desc: "An example of a disabled command."
+    placeholders: {}
+    require_confirm: false
+    require_sudo: false
+    disabled: true
 
-def recv_prefixed(sock: socket.socket) -> bytes:
-    length = int.from_bytes(recv_exact(sock, 4), "big")
-    return recv_exact(sock, length)
+  # --- File Management Commands ---
 
+  # Calculate the size of a directory.
+  dir_size:
+    cmd_template: ["du", "-sh", "{path}"]
+    desc: "Calculate and display the total size of a directory."
+    placeholders:
+      path: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-# ---------- QR helpers ----------
-def show_qr_code(ip, port):
-    url = f"darkdoc://{ip}:{port}"
-    qr = qrcode.make(url)
+  # Create a new directory, including parent directories.
+  make_dir:
+    cmd_template: ["mkdir", "-p", "-v", "{path}"]
+    desc: "Create a directory, including any parent directories needed."
+    placeholders:
+      path: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-    qr_window = tk.Toplevel()
-    qr_window.title("Scan this QR on Receiver")
-    qr_img = ImageTk.PhotoImage(qr)
-    label = tk.Label(qr_window, image=qr_img)
-    label.image = qr_img
-    label.pack(padx=10, pady=10)
+  # Securely remove a file or directory.
+  remove_item:
+    cmd_template: ["rm", "-rfv", "{path}"]
+    desc: "DANGEROUS: Recursively and forcefully remove a file or directory."
+    placeholders:
+      path: {required: true}
+    require_confirm: true
+    require_sudo: false
+    disabled: false
 
-    info = tk.Label(qr_window, text=url, font=("Consolas", 10))
-    info.pack(pady=5)
+  # Change ownership of a file/directory.
+  c_chown:
+    cmd_template: ["chown", "-R", "{owner}:{group}", "{path}"]
+    desc: "seclang: Recursively change the owner and group of a file or directory (requires sudo)."
+    placeholders:
+      owner: {required: true}
+      group: {required: true}
+      path: {required: true}
+    require_confirm: true
+    require_sudo: true
+    disabled: false
 
+  # Copy a file or directory.
+  copy_item:
+    cmd_template: ["cp", "-rv", "{source}", "{destination}"]
+    desc: "Copy a file or directory recursively and verbosely."
+    placeholders:
+      source: {required: true}
+      destination: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-def scan_qr_code():
-    cap = cv2.VideoCapture(0)
-    server_ip, server_port = None, None
+  # Move or rename a file or directory.
+  move_item:
+    cmd_template: ["mv", "-v", "{source}", "{destination}"]
+    desc: "Move or rename a file or directory."
+    placeholders:
+      source: {required: true}
+      destination: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        for code in decode(frame):
-            data = code.data.decode("utf-8")
-            if data.startswith("darkdoc://"):
-                parts = data.replace("darkdoc://", "").split(":")
-                server_ip = parts[0]
-                server_port = int(parts[1])
-                cap.release()
-                cv2.destroyAllWindows()
-                return server_ip, server_port
+  # Create an empty file.
+  touch_file:
+    cmd_template: ["touch", "{filename}"]
+    desc: "Create an empty file or update its modification time."
+    placeholders:
+      filename: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-        cv2.imshow("Scan QR - Press Q to cancel", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+  # Change file permissions.
+  set_perms:
+    cmd_template: ["chmod", "-v", "{mode}", "{path}"]
+    desc: "Change permissions of a file/directory (e.g., 755, u+x)."
+    placeholders:
+      mode: {required: true}
+      path: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-    cap.release()
-    cv2.destroyAllWindows()
-    return None, None
+  # Create a compressed tar archive.
+  create_archive:
+    cmd_template: ["tar", "-czvf", "{archive_name}.tar.gz", "{source_dir}"]
+    desc: "Create a compressed .tar.gz archive from a source directory."
+    placeholders:
+      archive_name: {required: true}
+      source_dir: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
+  # Extract a compressed tar archive.
+  extract_archive:
+    cmd_template: ["tar", "-xzvf", "{archive_file}"]
+    desc: "Extract a .tar.gz archive."
+    placeholders:
+      archive_file: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-# ---------- send / receive logic ----------
-def threaded_send_file(filename, update_ui_callback=None):
-    try:
-        if not os.path.exists(filename):
-            raise FileNotFoundError("File does not exist")
+  # Create a symbolic link.
+  create_symlink:
+    cmd_template: ["ln", "-sv", "{target}", "{link_name}"]
+    desc: "Create a symbolic link to a target file or directory."
+    placeholders:
+      target: {required: true}
+      link_name: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("0.0.0.0", PORT))
-            s.listen(1)
+  # Display the contents of a file.
+  cat_file:
+    cmd_template: ["cat", "{filename}"]
+    desc: "Display the contents of a file."
+    placeholders:
+      filename: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-            local_ip = socket.gethostbyname(socket.gethostname())
-            if update_ui_callback:
-                update_ui_callback(f"Server on {local_ip}:{PORT}, waiting for connection...")
+  # View the first few lines of a file.
+  head_file:
+    cmd_template: ["head", "{filename}"]
+    desc: "Display the first 10 lines of a file."
+    placeholders:
+      filename: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-            # show QR code in popup
-            root = tk.Tk()
-            root.withdraw()
-            root.after(0, show_qr_code, local_ip, PORT)
-            threading.Thread(target=root.mainloop, daemon=True).start()
+  # View the last few lines of a file.
+  tail_file:
+    cmd_template: ["tail", "{filename}"]
+    desc: "Display the last 10 lines of a file."
+    placeholders:
+      filename: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-            conn, addr = s.accept()
-            with conn:
-                if update_ui_callback:
-                    update_ui_callback(f"Connected by {addr}")
+  # Count lines, words, and characters in a file.
+  word_count:
+    cmd_template: ["wc", "{filename}"]
+    desc: "Count lines, words, and characters in a file."
+    placeholders:
+      filename: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-                # key exchange
-                local_priv = X25519PrivateKey.generate()
-                local_pub = local_priv.public_key().public_bytes(
-                    encoding=serialization.Encoding.Raw,
-                    format=serialization.PublicFormat.Raw
-                )
-                send_prefixed(conn, local_pub)
-                peer_pub_bytes = recv_prefixed(conn)
-                key = derive_shared_key(local_priv, peer_pub_bytes)
+  # Compare two files.
+  diff_files:
+    cmd_template: ["diff", "-u", "{file1}", "{file2}"]
+    desc: "Compare two files and show the differences."
+    placeholders:
+      file1: {required: true}
+      file2: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-                # send encrypted metadata
-                filesize = os.path.getsize(filename)
-                meta = json.dumps({"name": os.path.basename(filename), "size": filesize}).encode()
-                send_prefixed(conn, encrypt_chunk(meta, key))
+  # --- Networking Commands ---
 
-                # send file
-                with open(filename, "rb") as f:
-                    sent = 0
-                    while True:
-                        chunk = f.read(CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        send_prefixed(conn, encrypt_chunk(chunk, key))
-                        sent += len(chunk)
-                        if update_ui_callback:
-                            update_ui_callback(f"Sent {sent}/{filesize} bytes")
+  # Fetch a URL with curl.
+  curl_get:
+    cmd_template: ["curl", "-iL", "{url}"]
+    desc: "Fetch a URL with headers and follow redirects."
+    placeholders:
+      url: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-                if update_ui_callback:
-                    update_ui_callback(f"✅ File '{os.path.basename(filename)}' sent successfully.")
-    except Exception as e:
-        if update_ui_callback:
-            update_ui_callback(f"Error: {e}")
+  # Download a file with wget.
+  wget_file:
+    cmd_template: ["wget", "-c", "{url}"]
+    desc: "Download a file from a URL, continuing partial downloads."
+    placeholders:
+      url: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
+  # Perform a DNS lookup.
+  dns_lookup:
+    cmd_template: ["dig", "+short", "{domain}"]
+    desc: "Perform a quick DNS A record lookup for a domain."
+    placeholders:
+      domain: {required: true}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-def threaded_receive_file(server_ip, update_ui_callback=None, ask_save_path_callback=None):
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((server_ip, PORT))
-            if update_ui_callback:
-                update_ui_callback(f"Connected to {server_ip}:{PORT}")
+  # List open ports.
+  open_ports:
+    cmd_template: ["ss", "-tuln"]
+    desc: "List all listening TCP and UDP ports (requires sudo for process info)."
+    placeholders: {}
+    require_confirm: false
+    require_sudo: true
+    disabled: false
 
-            # key exchange
-            server_pub = recv_prefixed(s)
-            local_priv = X25519PrivateKey.generate()
-            local_pub = local_priv.public_key().public_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PublicFormat.Raw
-            )
-            send_prefixed(s, local_pub)
-            key = derive_shared_key(local_priv, server_pub)
+  # --- Other useful commands from previous suggestions ---
+  c_uptime:
+    cmd_template: ["uptime", "-p"]
+    desc: "Show system uptime in a pretty format."
+    placeholders: {}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
 
-            # metadata
-            enc_meta = recv_prefixed(s)
-            meta = json.loads(decrypt_chunk(enc_meta, key).decode())
-            filename = meta.get("name", "received_file")
-            filesize = int(meta.get("size", 0))
+  git_pull:
+    cmd_template: ["git", "pull"]
+    desc: "Run 'git pull' in the current directory."
+    placeholders: {}
+    require_confirm: false
+    require_sudo: false
+    disabled: false
+"""
 
-            if update_ui_callback:
-                update_ui_callback(f"Receiving {filename} ({filesize} bytes)")
+# --- Helper Functions ---
 
-            default_save = os.path.join(os.getcwd(), "received_" + filename)
-            save_path = filedialog.asksaveasfilename(initialfile="received_" + filename,
-                                                     initialdir=os.getcwd())
-            if not save_path:
-                if update_ui_callback:
-                    update_ui_callback("Receive canceled.")
-                return
-
-            received = 0
-            with open(save_path, "wb") as f:
-                while received < filesize:
-                    enc_chunk = recv_prefixed(s)
-                    chunk = decrypt_chunk(enc_chunk, key)
-                    f.write(chunk)
-                    received += len(chunk)
-                    if update_ui_callback:
-                        update_ui_callback(f"Received {received}/{filesize} bytes")
-
-            if update_ui_callback:
-                update_ui_callback(f"✅ File saved to {save_path}")
-    except Exception as e:
-        if update_ui_callback:
-            update_ui_callback(f"Error: {e}")
-
-
-# ---------- GUI ----------
-def start_send_ui(status_var):
-    filename = filedialog.askopenfilename(title="Select a file to send")
-    if not filename:
+def setup_config_dir():
+    """Ensures the config directory and default config file exist."""
+    if CONFIG_FILE.exists():
         return
-    t = threading.Thread(target=threaded_send_file,
-                         args=(filename, lambda msg: status_var.set(msg)),
-                         daemon=True)
-    t.start()
+    
+    click.echo(f"Welcome to seclang! Creating default configuration...")
+    try:
+        CONFIG_DIR.mkdir(exist_ok=True)
+        with open(CONFIG_FILE, "w") as f:
+            f.write(DEFAULT_CONFIG)
+        click.secho(f"✔ Default config created at: {CONFIG_FILE}", fg="green")
+        click.echo("You can now edit this file to add your own custom commands.")
+        click.echo("Run 'seclang list' to see available commands.")
+    except OSError as e:
+        click.secho(f"Error: Could not create config directory or file: {e}", fg="red", err=True)
+        sys.exit(1)
 
+def load_config():
+    """Loads and returns the command configurations from the YAML file."""
+    setup_config_dir()
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            config = yaml.safe_load(f)
+            # If the YAML file is empty or malformed, config might be None.
+            if not config:
+                return {}
+            return config.get("commands", {})
+    except (yaml.YAMLError, FileNotFoundError) as e:
+        click.secho(f"Error: Could not load or parse config file at {CONFIG_FILE}: {e}", fg="red", err=True)
+        sys.exit(1)
 
-def start_receive_ui(root, status_var):
-    server_ip = simpledialog.askstring("DarkDoc", "Enter Server IP:")
-    if not server_ip:
+def log_command(command_name, final_cmd, args, return_code):
+    """Logs a command execution to the history.log file in JSON format."""
+    log_entry = {
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "user": getpass.getuser(),
+        "command_name": command_name,
+        "executed_cmd": final_cmd,
+        "args": args,
+        "return_code": return_code,
+    }
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(json.dumps(log_entry) + "\n")
+    except OSError as e:
+        click.secho(f"Warning: Could not write to log file {LOG_FILE}: {e}", fg="yellow", err=True)
+
+def build_command(cmd_def, user_args):
+    """Builds the final command list by substituting placeholders with user arguments."""
+    placeholders = cmd_def.get("placeholders", {}) or {}
+    required_placeholders = [p for p, rules in placeholders.items() if rules.get("required")]
+
+    if len(user_args) != len(required_placeholders):
+        click.secho(f"Error: Incorrect number of arguments for '{cmd_def['name']}'.", fg="red", err=True)
+        click.echo(f"Expected {len(required_placeholders)} arguments for: {', '.join(required_placeholders)}")
+        click.echo(f"Received {len(user_args)}.")
+        sys.exit(1)
+
+    arg_map = dict(zip(required_placeholders, user_args))
+    final_cmd = []
+    
+    for token in cmd_def["cmd_template"]:
+        if token.startswith("{") and token.endswith("}"):
+            placeholder_name = token[1:-1]
+            if placeholder_name in arg_map:
+                # subprocess with a list handles arguments safely, no manual quoting needed.
+                final_cmd.append(arg_map[placeholder_name])
+            else:
+                # This case handles tokens that look like placeholders but aren't in the spec
+                final_cmd.append(token)
+        else:
+            final_cmd.append(token)
+            
+    # Prepend 'sudo' if required by the command definition
+    if cmd_def.get("require_sudo") and "sudo" not in final_cmd:
+        final_cmd.insert(0, "sudo")
+        
+    return final_cmd
+
+# --- CLI Command Definitions ---
+
+@click.group()
+@click.version_option(version="1.0.0", prog_name="seclang", message="%(prog)s version %(version)s\nMade by sreehitha and team")
+def cli():
+    """
+    SecLang is a tool to manage and run complex shell commands using simple,
+    memorable shortcuts.
+
+    Note: This tool is designed for Unix/Linux environments (like Linux, macOS, or WSL
+    on Windows). The 'install' command specifically targets bash and zsh.
+    """
+    pass
+
+@cli.command("list")
+def list_commands():
+    """Lists all available command shortcuts."""
+    commands = load_config()
+    if not commands:
+        click.echo("No commands found in your configuration file.")
+        click.echo(f"Add some to {CONFIG_FILE} to get started!")
         return
-    t = threading.Thread(target=threaded_receive_file,
-                         args=(server_ip, lambda msg: status_var.set(msg), None),
-                         daemon=True)
-    t.start()
 
+    click.secho("Available Commands:", bold=True)
+    for name, details in commands.items():
+        status = click.style(" (disabled)", fg="yellow") if details.get("disabled") else ""
+        desc = details.get("desc", "No description.")
+        click.echo(f"- {click.style(name, fg='cyan', bold=True)}{status}: {desc}")
 
-def handle_qr_receive(root, status_var):
-    ip, port = scan_qr_code()
-    if ip:
-        status_var.set(f"Scanned IP: {ip}:{port}")
-        t = threading.Thread(target=threaded_receive_file,
-                             args=(ip, lambda msg: status_var.set(msg), None),
-                             daemon=True)
-        t.start()
+@cli.command("show")
+@click.argument("name")
+def show_command(name):
+    """Shows detailed information about a specific command."""
+    commands = load_config()
+    cmd_def = commands.get(name)
+
+    if not cmd_def:
+        click.secho(f"Error: Command '{name}' not found.", fg="red", err=True)
+        sys.exit(1)
+
+    click.secho(f"Details for '{name}':", bold=True)
+    click.echo(f"  Description: {cmd_def.get('desc', 'N/A')}")
+    click.echo(f"  Template:    {' '.join(cmd_def.get('cmd_template', []))}")
+    click.echo(f"  Confirm:     {cmd_def.get('require_confirm', False)}")
+    click.echo(f"  Sudo:        {cmd_def.get('require_sudo', False)}")
+    click.echo(f"  Disabled:    {cmd_def.get('disabled', False)}")
+    
+    placeholders = cmd_def.get("placeholders") or {}
+    if placeholders:
+        click.echo("  Placeholders:")
+        for p_name, rules in placeholders.items():
+            req = "required" if rules.get("required") else "optional"
+            click.echo(f"    - {{{p_name}}} ({req})")
     else:
-        messagebox.showerror("DarkDoc", "No QR code detected.")
+        click.echo("  Placeholders: None")
 
+@cli.command("run")
+@click.argument("name")
+@click.argument("args", nargs=-1)
+def run_command(name, args):
+    """Executes a command shortcut with the given arguments."""
+    commands = load_config()
+    cmd_def = commands.get(name)
 
-def main():
-    root = tk.Tk()
-    root.title("DarkDoc P2P (Encrypted + QR)")
-    root.geometry("450x260")
+    if not cmd_def:
+        click.secho(f"Error: Command '{name}' not found.", fg="red", err=True)
+        sys.exit(1)
 
-    lbl = tk.Label(root, text="DarkDoc P2P — Encrypted (LAN)", font=("Consolas", 14, "bold"))
-    lbl.pack(pady=12)
+    if cmd_def.get("disabled"):
+        click.secho(f"Error: Command '{name}' is disabled and cannot be run.", fg="yellow", err=True)
+        sys.exit(1)
+    
+    # Add the command name to the definition for easier access
+    cmd_def['name'] = name
+    
+    final_cmd = build_command(cmd_def, args)
+    
+    click.echo(f"Executing '{name}': ", nl=False)
+    click.secho(' '.join(final_cmd), fg="bright_blue")
 
-    status_var = tk.StringVar(value="Ready")
+    if cmd_def.get("require_confirm"):
+        if not click.confirm("Do you want to continue?"):
+            click.echo("Execution cancelled by user.")
+            sys.exit(0)
+    
+    # --- Command Execution with '&&' support ---
+    try:
+        # Split command list by '&&' to run them sequentially
+        sub_commands = []
+        current_cmd = []
+        for token in final_cmd:
+            if token == "&&":
+                if current_cmd:
+                    sub_commands.append(current_cmd)
+                    current_cmd = []
+            else:
+                current_cmd.append(token)
+        if current_cmd:
+            sub_commands.append(current_cmd)
 
-    btn_frame = tk.Frame(root)
-    btn_frame.pack(pady=8)
+        final_return_code = 0
+        for i, sub_cmd in enumerate(sub_commands):
+            click.echo(f"  -> Running part {i+1}/{len(sub_commands)}: {click.style(' '.join(sub_cmd), fg='bright_blue')}")
+            result = subprocess.run(sub_cmd, check=False)
+            final_return_code = result.returncode
+            if result.returncode != 0:
+                click.secho(f"  Sub-command failed with exit code {result.returncode}. Halting execution.", fg="red")
+                break
+        
+        log_command(name, final_cmd, args, final_return_code)
+    except FileNotFoundError:
+        click.secho(f"Error: The program '{final_cmd[0]}' was not found.", fg="red", err=True)
+        click.echo("Please ensure it is installed and in your system's PATH.")
+        log_command(name, final_cmd, args, -1)
+        sys.exit(1)
+    except Exception as e:
+        click.secho(f"An unexpected error occurred: {e}", fg="red", err=True)
+        log_command(name, final_cmd, args, -1)
+        sys.exit(1)
 
-    send_btn = tk.Button(btn_frame, text="📤 Send File", width=20,
-                         command=lambda: start_send_ui(status_var))
-    send_btn.grid(row=0, column=0, padx=8, pady=6)
+@cli.command("history")
+def show_history():
+    """Shows the last 20 executed commands from the log."""
+    if not LOG_FILE.exists():
+        click.echo("No history log found. Run some commands first!")
+        return
 
-    recv_btn = tk.Button(btn_frame, text="📥 Receive File", width=20,
-                         command=lambda: start_receive_ui(root, status_var))
-    recv_btn.grid(row=0, column=1, padx=8, pady=6)
+    click.secho("Command Execution History (last 20):", bold=True)
+    try:
+        with open(LOG_FILE, "r") as f:
+            lines = f.readlines()
+        
+        if not lines:
+            click.echo("History is empty.")
+            return
 
-    scan_btn = tk.Button(btn_frame, text="📷 Scan QR", width=43,
-                         command=lambda: handle_qr_receive(root, status_var))
-    scan_btn.grid(row=1, column=0, columnspan=2, pady=6)
+        for line in lines[-20:]:
+            log = json.loads(line)
+            ts = datetime.datetime.fromisoformat(log['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
+            status_color = "green" if log['return_code'] == 0 else "red"
+            status = click.style(f"RC={log['return_code']}", fg=status_color)
+            cmd_name = click.style(log['command_name'], fg="cyan")
+            click.echo(f"[{ts}] {status} - {cmd_name} {' '.join(log['args'])}")
+            
+    except (json.JSONDecodeError, OSError) as e:
+        click.secho(f"Error reading history file: {e}", fg="red", err=True)
 
-    status_label = tk.Label(root, textvariable=status_var, font=("Consolas", 10), fg="#00cc66")
-    status_label.pack(pady=18)
+@cli.command("install")
+def install_wrappers():
+    """Installs shell functions to run shortcuts directly."""
+    commands = load_config()
+    shell = Path(os.environ.get("SHELL", "")).name
+    
+    if shell in ("bash", "zsh"):
+        rc_file_path = Path.home() / f".{shell}rc"
+    else:
+        click.secho(f"Error: Unsupported shell '{shell}'. Only 'bash' and 'zsh' are supported.", fg="red")
+        sys.exit(1)
 
-    hint = tk.Label(root, text="Both devices must be on the same LAN. Allow firewall if needed.",
-                    font=("Arial", 8))
-    hint.pack(side="bottom", pady=6)
+    click.echo(f"Detected shell: {shell}. Will modify: {rc_file_path}")
 
-    root.mainloop()
+    # Create a backup
+    backup_path = rc_file_path.with_suffix(rc_file_path.suffix + f".bak.{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}")
+    try:
+        import shutil
+        shutil.copy2(rc_file_path, backup_path)
+        click.secho(f"✔ Backed up your shell configuration to: {backup_path}", fg="green")
+    except Exception as e:
+        click.secho(f"Warning: Could not create backup of {rc_file_path}: {e}", fg="yellow")
 
+    # Generate the wrapper functions
+    wrapper_script = "\n# --- seclang functions start ---\n"
+    wrapper_script += "# Automatically generated by 'seclang install'. Do not edit manually.\n"
+
+    python_executable = sys.executable
+    script_path = Path(__file__).resolve()
+
+    for name, details in commands.items():
+        if not details.get("disabled"):
+            wrapper_script += f"""
+{name}() {{
+    "{python_executable}" "{script_path}" run {name} "$@"
+}}
+"""
+    wrapper_script += "# --- seclang functions end ---\n"
+
+    # Read the existing rc file
+    with open(rc_file_path, "r") as f:
+        content = f.read()
+
+    # Remove any old seclang blocks
+    start_marker = "# --- seclang functions start ---"
+    end_marker = "# --- seclang functions end ---"
+    if start_marker in content:
+        start_index = content.find(start_marker)
+        end_index = content.find(end_marker) + len(end_marker)
+        content = content[:start_index].rstrip() + content[end_index:].lstrip()
+        click.secho("✔ Removed existing seclang functions from your shell config.", fg="green")
+
+    # Append the new block
+    with open(rc_file_path, "a") as f:
+        f.write(wrapper_script)
+
+    click.secho("✔ Successfully installed command wrappers!", fg="green", bold=True)
+    click.echo(f"Please restart your terminal or run 'source {rc_file_path}' to use the new shortcuts.")
+    click.echo("Example: 'ping_test 8.8.8.8'")
 
 if __name__ == "__main__":
-    main()
+    # This allows the script to be run directly, e.g., `python seclang.py list`
+    # It also handles the case where the script is not found in the path.
+    cli()
